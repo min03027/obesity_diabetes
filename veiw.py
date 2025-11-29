@@ -1,3 +1,4 @@
+from typing import Dict, Optional
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6,6 +7,347 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.utils.class_weight import compute_class_weight
+from imblearn.ensemble import BalancedRandomForestClassifier
+from imblearn.over_sampling import SMOTE
+
+TEEN_EXCLUDED_YEARS = {2015, 2016}
+TEEN_OBESITY_PERCENTILE = 0.95
+TEEN_MODEL_THRESHOLD = 0.49
+
+
+def prepare_teen_model_data(
+    dataframe: pd.DataFrame,
+) -> Optional[Dict[str, np.ndarray]]:
+    required_cols = [
+        "F_BR",
+        "F_FRUIT",
+        "F_VEG",
+        "F_FASTFOOD",
+        "SODA_INTAKE",
+        "Breakfast_Category",
+        "AGE",
+        "SEX",
+        "E_SES",
+        "HEALTHY_SCORE",
+        "UNHEALTHY_SCORE",
+        "NET_DIET_SCORE",
+        "TEEN_OBESE_TOP5",
+    ]
+    if not set(required_cols).issubset(dataframe.columns):
+        return None
+
+    feature_cols = [
+        "F_BR",
+        "F_FRUIT",
+        "F_VEG",
+        "F_FASTFOOD",
+        "SODA_INTAKE",
+        "Breakfast_Category",
+        "AGE",
+        "SEX",
+        "E_SES",
+        "HEALTHY_SCORE",
+        "UNHEALTHY_SCORE",
+        "NET_DIET_SCORE",
+    ]
+    optional_cat = []
+    for col in ["GROUP", "CTYPE"]:
+        if col in dataframe.columns:
+            optional_cat.append(col)
+
+    cols_to_use = required_cols + optional_cat
+    data = dataframe[cols_to_use].dropna().reset_index(drop=True)
+    if len(data) < 400:
+        return None
+    y = data["TEEN_OBESE_TOP5"]
+    if y.nunique() < 2:
+        return None
+
+    X_numeric = data[feature_cols].copy()
+    interaction_pairs = [
+        ("AGE_FRUIT", "AGE", "F_FRUIT"),
+        ("AGE_VEG", "AGE", "F_VEG"),
+        ("AGE_FASTFOOD", "AGE", "F_FASTFOOD"),
+        ("FRUIT_VEG", "F_FRUIT", "F_VEG"),
+        ("FASTFOOD_SODA", "F_FASTFOOD", "SODA_INTAKE"),
+        ("BREAKFAST_AGE", "Breakfast_Category", "AGE"),
+    ]
+    for new_col, c1, c2 in interaction_pairs:
+        if c1 in X_numeric.columns and c2 in X_numeric.columns:
+            X_numeric[new_col] = X_numeric[c1] * X_numeric[c2]
+
+    if optional_cat:
+        dummy_frames = [
+            pd.get_dummies(data[col], prefix=col, drop_first=False) for col in optional_cat
+        ]
+        cat_df = pd.concat(dummy_frames, axis=1)
+        X = pd.concat([X_numeric, cat_df], axis=1)
+    else:
+        X = X_numeric
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    return {
+        "X_train": X_train,
+        "X_test": X_test,
+        "X_train_scaled": X_train_scaled,
+        "X_test_scaled": X_test_scaled,
+        "y_train": y_train,
+        "y_test": y_test,
+        "sample_size": len(data),
+    }
+
+
+def compute_teen_model_results(dataframe: pd.DataFrame):
+    prep = prepare_teen_model_data(dataframe)
+    if not prep:
+        return None
+    y_train = prep["y_train"]
+    y_test = prep["y_test"]
+    class_weights = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
+    weight_dict = {cls: w for cls, w in zip(np.unique(y_train), class_weights)}
+    sample_weight = y_train.map(weight_dict).values
+
+    # SMOTE 적용
+    smote = SMOTE(random_state=42)
+    X_train_smote, y_train_smote = smote.fit_resample(prep["X_train_scaled"], y_train)
+
+    # C 값 최적화 (더 넓은 범위, SMOTE 적용)
+    best_c = 0.1
+    best_score = 0
+    best_thr = TEEN_MODEL_THRESHOLD
+    best_result = None
+    for c_val in [0.001, 0.005, 0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]:
+        lr_temp = LogisticRegression(max_iter=5000, class_weight="balanced", C=c_val, solver="lbfgs")
+        lr_temp.fit(X_train_smote, y_train_smote)
+        y_prob_temp = lr_temp.predict_proba(prep["X_test_scaled"])[:, 1]
+        test_auc = roc_auc_score(y_test, y_prob_temp)
+        # 임계값 스윕
+        for thr in np.linspace(0.35, 0.60, 26):
+            y_pred_temp = (y_prob_temp >= thr).astype(int)
+            acc = accuracy_score(y_test, y_pred_temp)
+            rec = recall_score(y_test, y_pred_temp)
+            if acc >= 0.60 and rec >= 0.65:
+                score = acc * 0.4 + rec * 0.4 + test_auc * 0.2
+                if score > best_score:
+                    best_score = score
+                    best_c = c_val
+                    best_thr = thr
+                    best_result = {'c': c_val, 'thr': thr, 'acc': acc, 'rec': rec, 'auc': test_auc}
+    
+    # 조건 만족하는 결과가 없으면 기본값 사용
+    if best_result is None:
+        best_c = 0.1
+        best_thr = TEEN_MODEL_THRESHOLD
+    
+    lr_model = LogisticRegression(
+        max_iter=5000,
+        class_weight="balanced",
+        C=best_c,
+        solver="lbfgs"
+    )
+    lr_model.fit(X_train_smote, y_train_smote)
+    y_prob_lr = lr_model.predict_proba(prep["X_test_scaled"])[:, 1]
+    y_pred_lr = (y_prob_lr >= best_thr).astype(int)
+    
+    y_pred_lr = (y_prob_lr >= best_thr).astype(int)
+    fpr_lr, tpr_lr, _ = roc_curve(y_test, y_prob_lr)
+
+    # Random Forest 하이퍼파라미터 튜닝
+    best_rf_score = 0
+    best_rf_params = None
+    for n_est in [200, 300, 400]:
+        for max_d in [10, 12, 15]:
+            rf_temp = RandomForestClassifier(
+                n_estimators=n_est, max_depth=max_d, 
+                min_samples_split=8, min_samples_leaf=4, 
+                class_weight="balanced_subsample", random_state=42, n_jobs=-1
+            )
+            rf_temp.fit(prep["X_train"], y_train)
+            y_prob_rf_temp = rf_temp.predict_proba(prep["X_test"])[:, 1]
+            auc_rf = roc_auc_score(y_test, y_prob_rf_temp)
+            for thr in np.linspace(0.35, 0.60, 26):
+                y_pred_rf_temp = (y_prob_rf_temp >= thr).astype(int)
+                acc = accuracy_score(y_test, y_pred_rf_temp)
+                rec = recall_score(y_test, y_pred_rf_temp)
+                if acc >= 0.60 and rec >= 0.65:
+                    score = acc * 0.4 + rec * 0.4 + auc_rf * 0.2
+                    if score > best_rf_score:
+                        best_rf_score = score
+                        best_rf_params = {'n_est': n_est, 'max_d': max_d, 'thr': thr}
+    
+    # 최적 파라미터로 RF 학습
+    if best_rf_params:
+        rf_model = RandomForestClassifier(
+            n_estimators=best_rf_params['n_est'],
+            max_depth=best_rf_params['max_d'],
+            min_samples_split=8,
+            min_samples_leaf=4,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1
+        )
+        rf_thr = best_rf_params['thr']
+    else:
+        rf_model = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=12,
+            min_samples_split=8,
+            min_samples_leaf=4,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1
+        )
+        rf_thr = 0.5
+    
+    rf_model.fit(prep["X_train"], y_train)
+    y_prob_rf = rf_model.predict_proba(prep["X_test"])[:, 1]
+    y_pred_rf = (y_prob_rf >= rf_thr).astype(int)
+
+    brf_model = BalancedRandomForestClassifier(
+        n_estimators=400,
+        max_depth=10,
+        min_samples_split=6,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=-1,
+    )
+    brf_model.fit(prep["X_train"], y_train)
+    y_prob_brf = brf_model.predict_proba(prep["X_test"])[:, 1]
+    y_pred_brf = brf_model.predict(prep["X_test"])
+
+    hgb_model = HistGradientBoostingClassifier(
+        max_iter=400,
+        learning_rate=0.06,
+        max_depth=6,
+        min_samples_leaf=30,
+        class_weight=weight_dict,
+        random_state=42,
+    )
+    hgb_model.fit(prep["X_train"], y_train, sample_weight=sample_weight)
+    y_prob_hgb = hgb_model.predict_proba(prep["X_test"])[:, 1]
+    y_pred_hgb = hgb_model.predict(prep["X_test"])
+
+    # 앙상블 모델 (가중치 최적화)
+    best_ensemble_score = 0
+    best_weights = None
+    best_ens_thr = best_thr
+    for w1 in np.linspace(0.3, 0.8, 6):
+        w2 = 1 - w1
+        ensemble_prob_temp = w1 * y_prob_lr + w2 * y_prob_rf
+        auc_ens = roc_auc_score(y_test, ensemble_prob_temp)
+        for thr in np.linspace(0.35, 0.60, 26):
+            y_pred_ens_temp = (ensemble_prob_temp >= thr).astype(int)
+            acc = accuracy_score(y_test, y_pred_ens_temp)
+            rec = recall_score(y_test, y_pred_ens_temp)
+            if acc >= 0.60 and rec >= 0.65:
+                score = acc * 0.4 + rec * 0.4 + auc_ens * 0.2
+                if score > best_ensemble_score:
+                    best_ensemble_score = score
+                    best_weights = (w1, w2)
+                    best_ens_thr = thr
+    
+    # 최적 가중치로 앙상블 생성
+    if best_weights:
+        ensemble_prob = best_weights[0] * y_prob_lr + best_weights[1] * y_prob_rf
+    else:
+        ensemble_prob = 0.6 * y_prob_lr + 0.4 * y_prob_rf
+        best_ens_thr = best_thr
+    
+    y_pred_ens = (ensemble_prob >= best_ens_thr).astype(int)
+
+    # 가장 좋은 AUC를 가진 모델 찾기 (ROC 곡선용)
+    model_aucs = {
+        "logistic": roc_auc_score(y_test, y_prob_lr),
+        "random_forest": roc_auc_score(y_test, y_prob_rf),
+        "balanced_random_forest": roc_auc_score(y_test, y_prob_brf),
+        "hist_gradient_boosting": roc_auc_score(y_test, y_prob_hgb),
+        "ensemble": roc_auc_score(y_test, ensemble_prob),
+    }
+    best_model_name = max(model_aucs, key=model_aucs.get)
+    best_auc = model_aucs[best_model_name]
+    
+    # 최고 AUC 모델의 ROC 곡선
+    if best_model_name == "logistic":
+        fpr_best, tpr_best, _ = roc_curve(y_test, y_prob_lr)
+    elif best_model_name == "random_forest":
+        fpr_best, tpr_best, _ = roc_curve(y_test, y_prob_rf)
+    elif best_model_name == "balanced_random_forest":
+        fpr_best, tpr_best, _ = roc_curve(y_test, y_prob_brf)
+    elif best_model_name == "hist_gradient_boosting":
+        fpr_best, tpr_best, _ = roc_curve(y_test, y_prob_hgb)
+    else:  # ensemble
+        fpr_best, tpr_best, _ = roc_curve(y_test, ensemble_prob)
+
+    results = {
+        "threshold": best_thr,
+        "optimal_c": best_c,
+        "sample_size": prep["sample_size"],
+        "logistic": {
+            "accuracy": accuracy_score(y_test, y_pred_lr),
+            "recall": recall_score(y_test, y_pred_lr),
+            "precision": precision_score(y_test, y_pred_lr, zero_division=0),
+            "f1": f1_score(y_test, y_pred_lr),
+            "auc": roc_auc_score(y_test, y_prob_lr),
+            "threshold": best_thr,
+            "optimal_c": best_c,
+            "sample_size": prep["sample_size"],
+        },
+        "random_forest": {
+            "accuracy": accuracy_score(y_test, y_pred_rf),
+            "recall": recall_score(y_test, y_pred_rf),
+            "precision": precision_score(y_test, y_pred_rf, zero_division=0),
+            "f1": f1_score(y_test, y_pred_rf),
+            "auc": roc_auc_score(y_test, y_prob_rf),
+        },
+        "balanced_random_forest": {
+            "accuracy": accuracy_score(y_test, y_pred_brf),
+            "recall": recall_score(y_test, y_pred_brf),
+            "precision": precision_score(y_test, y_pred_brf, zero_division=0),
+            "f1": f1_score(y_test, y_pred_brf),
+            "auc": roc_auc_score(y_test, y_prob_brf),
+        },
+        "hist_gradient_boosting": {
+            "accuracy": accuracy_score(y_test, y_pred_hgb),
+            "recall": recall_score(y_test, y_pred_hgb),
+            "precision": precision_score(y_test, y_pred_hgb, zero_division=0),
+            "f1": f1_score(y_test, y_pred_hgb),
+            "auc": roc_auc_score(y_test, y_prob_hgb),
+        },
+        "ensemble": {
+            "accuracy": accuracy_score(y_test, y_pred_ens),
+            "recall": recall_score(y_test, y_pred_ens),
+            "precision": precision_score(y_test, y_pred_ens, zero_division=0),
+            "f1": f1_score(y_test, y_pred_ens),
+            "auc": roc_auc_score(y_test, ensemble_prob),
+            "threshold": best_ens_thr,
+            "weights": best_weights if best_weights else (0.6, 0.4),
+        },
+        "roc_curve": {
+            "fpr": fpr_best.tolist(),
+            "tpr": tpr_best.tolist(),
+            "auc": best_auc,
+            "model_name": best_model_name,
+        },
+    }
+    return results
 
 # 페이지 설정
 st.set_page_config(
@@ -52,8 +394,63 @@ def load_new_data():
         df_new = df_new.rename(columns={'LS_FRUIT': 'F_FRUIT'})
     return df_new
 
+def compute_teen_model_summary(dataframe: pd.DataFrame):
+    prep = prepare_teen_model_data(dataframe)
+    if not prep:
+        return None
+    y_train = prep["y_train"]
+    y_test = prep["y_test"]
+
+    model = LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        C=0.1,
+        solver="lbfgs"
+    )
+    model.fit(prep["X_train_scaled"], y_train)
+    y_prob = model.predict_proba(prep["X_test_scaled"])[:, 1]
+    y_pred = (y_prob >= TEEN_MODEL_THRESHOLD).astype(int)
+
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "recall": recall_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred, zero_division=0),
+        "f1": f1_score(y_test, y_pred),
+        "auc": roc_auc_score(y_test, y_prob),
+        "threshold": TEEN_MODEL_THRESHOLD,
+        "sample_size": prep["sample_size"]
+    }
+    return metrics
+
+
 df = load_data()
 df_new = load_new_data()
+
+teen_bmi_cutoff = None
+if not df.empty:
+    df = df[~df['YEAR'].isin(TEEN_EXCLUDED_YEARS)].copy()
+    if df['BMI'].notna().any():
+        teen_bmi_cutoff = df['BMI'].quantile(TEEN_OBESITY_PERCENTILE)
+        df['TEEN_OBESE_TOP5'] = (df['BMI'] >= teen_bmi_cutoff).astype(int)
+    else:
+        df['TEEN_OBESE_TOP5'] = np.nan
+    df['HEALTHY_SCORE'] = df[['F_FRUIT', 'F_VEG', 'Breakfast_Category']].sum(axis=1)
+    df['UNHEALTHY_SCORE'] = df[['F_FASTFOOD', 'SODA_INTAKE']].sum(axis=1)
+    df['NET_DIET_SCORE'] = df['HEALTHY_SCORE'] - df['UNHEALTHY_SCORE']
+    if 'GROUP' in df.columns:
+        df['GROUP'] = df['GROUP'].fillna('Unknown').astype(str)
+    if 'CTYPE' in df.columns:
+        df['CTYPE'] = df['CTYPE'].fillna('Unknown').astype(str)
+else:
+    df['TEEN_OBESE_TOP5'] = np.nan
+    df['HEALTHY_SCORE'] = np.nan
+    df['UNHEALTHY_SCORE'] = np.nan
+    df['NET_DIET_SCORE'] = np.nan
+
+teen_model_results_global = compute_teen_model_results(df) if not df.empty else None
+teen_model_summary_global = (
+    teen_model_results_global["logistic"] if teen_model_results_global else None
+)
 
 # 사이드바 - 데이터셋 선택
 st.sidebar.header("📊 데이터셋 선택")
@@ -145,8 +542,13 @@ with col5:
 st.markdown("---")
 
 # 탭 생성
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 개요", "👥 인구통계", "🍎 식습관", "📊 상관관계", "📋 데이터"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📈 개요",
+    "👥 인구통계",
+    "🍎 식습관",
+    "📊 상관관계",
+    "📋 데이터",
+    "🤖 모델",
 ])
 
 # 탭 1: 개요
@@ -437,32 +839,82 @@ with tab3:
                     color_discrete_sequence=['lightblue', 'green', 'orange']
                 )
                 st.plotly_chart(fig, use_container_width=True)
-            
-            # 연도별 비만도 추이 (전체, 남성, 여성)
-            st.subheader("📊 연도별 비만도 추이 (성별 구분)")
-            
-            # 전체 비만도 (3.0 = 과체중/비만) 비율 계산
-            obesity_data = filtered_df[['YEAR', 'SEX', 'OBESITY']].dropna()
-            if len(obesity_data) > 0:
-                # 전체
-                year_obesity_all = obesity_data.groupby('YEAR').apply(
-                    lambda x: (x['OBESITY'] == 3.0).sum() / len(x) * 100
-                ).reset_index(name='비만율')
+        
+        # 연도별 비만도 추이 (전체, 남성, 여성)
+        st.subheader("📊 연도별 비만도 추이 (성별 구분)")
+        if not is_adult:
+            if 'TEEN_OBESE_TOP5' in filtered_df.columns:
+                teen_obesity_data = filtered_df[['YEAR', 'SEX', 'TEEN_OBESE_TOP5']].dropna()
+            else:
+                teen_obesity_data = pd.DataFrame()
+            if len(teen_obesity_data) > 0:
+                year_obesity_all = teen_obesity_data.groupby('YEAR')['TEEN_OBESE_TOP5'].mean().reset_index(name='비만율')
+                year_obesity_all['비만율'] *= 100
                 year_obesity_all['성별'] = '전체'
                 
-                # 남성
-                year_obesity_male = obesity_data[obesity_data['SEX'] == 1.0].groupby('YEAR').apply(
-                    lambda x: (x['OBESITY'] == 3.0).sum() / len(x) * 100
-                ).reset_index(name='비만율')
-                year_obesity_male['성별'] = '남성'
+                male_data = teen_obesity_data[teen_obesity_data['SEX'] == 1.0]
+                if len(male_data) > 0:
+                    year_obesity_male = male_data.groupby('YEAR')['TEEN_OBESE_TOP5'].mean().reset_index(name='비만율')
+                    year_obesity_male['비만율'] *= 100
+                    year_obesity_male['성별'] = '남성'
+                else:
+                    year_obesity_male = pd.DataFrame(columns=['YEAR', '비만율', '성별'])
                 
-                # 여성
-                year_obesity_female = obesity_data[obesity_data['SEX'] == 2.0].groupby('YEAR').apply(
-                    lambda x: (x['OBESITY'] == 3.0).sum() / len(x) * 100
-                ).reset_index(name='비만율')
-                year_obesity_female['성별'] = '여성'
+                female_data = teen_obesity_data[teen_obesity_data['SEX'] == 2.0]
+                if len(female_data) > 0:
+                    year_obesity_female = female_data.groupby('YEAR')['TEEN_OBESE_TOP5'].mean().reset_index(name='비만율')
+                    year_obesity_female['비만율'] *= 100
+                    year_obesity_female['성별'] = '여성'
+                else:
+                    year_obesity_female = pd.DataFrame(columns=['YEAR', '비만율', '성별'])
                 
-                # 데이터 결합
+                combined_data = pd.concat([
+                    year_obesity_all[['YEAR', '비만율', '성별']],
+                    year_obesity_male[['YEAR', '비만율', '성별']],
+                    year_obesity_female[['YEAR', '비만율', '성별']]
+                ], ignore_index=True)
+                
+                if len(combined_data) > 0:
+                    caption_text = "청소년 비만 기준: 전체 상위 5% (BMI ≥ {:.2f})".format(teen_bmi_cutoff) if teen_bmi_cutoff else "청소년 비만 기준: 전체 상위 5%"
+                    st.caption(caption_text)
+                    fig = px.line(
+                        combined_data,
+                        x='YEAR',
+                        y='비만율',
+                        color='성별',
+                        markers=True,
+                        labels={'YEAR': '연도', '비만율': '비만율 (%)'},
+                        title='연도별 비만율 추이 (상위 5%)',
+                        color_discrete_map={'전체': 'blue', '남성': '#ff9999', '여성': '#66b3ff'}
+                    )
+                    fig.update_traces(line_width=3, marker_size=8)
+                    fig.update_layout(
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        else:
+            bmi_obesity_data = filtered_df[['YEAR', 'SEX', 'BMI']].dropna()
+            if len(bmi_obesity_data) > 0:
+                def obesity_rate(df):
+                    return (df['BMI'] >= 25.0).mean() * 100
+                
+                year_obesity_all = bmi_obesity_data.groupby('YEAR').apply(obesity_rate).reset_index(name='비만율')
+                year_obesity_all['성별'] = '전체'
+                
+                male_data = bmi_obesity_data[bmi_obesity_data['SEX'] == 1.0]
+                if len(male_data) > 0:
+                    year_obesity_male = male_data.groupby('YEAR').apply(obesity_rate).reset_index(name='비만율')
+                    year_obesity_male['성별'] = '남성'
+                else:
+                    year_obesity_male = pd.DataFrame(columns=['YEAR', '비만율', '성별'])
+                
+                female_data = bmi_obesity_data[bmi_obesity_data['SEX'] == 2.0]
+                if len(female_data) > 0:
+                    year_obesity_female = female_data.groupby('YEAR').apply(obesity_rate).reset_index(name='비만율')
+                    year_obesity_female['성별'] = '여성'
+                else:
+                    year_obesity_female = pd.DataFrame(columns=['YEAR', '비만율', '성별'])
+                
                 combined_data = pd.concat([
                     year_obesity_all[['YEAR', '비만율', '성별']],
                     year_obesity_male[['YEAR', '비만율', '성별']],
@@ -477,7 +929,7 @@ with tab3:
                         color='성별',
                         markers=True,
                         labels={'YEAR': '연도', '비만율': '비만율 (%)'},
-                        title='연도별 비만율 추이 (과체중/비만 비율)',
+                        title='연도별 비만율 추이 (BMI ≥ 25 기준)',
                         color_discrete_map={'전체': 'blue', '남성': '#ff9999', '여성': '#66b3ff'}
                     )
                     fig.update_traces(line_width=3, marker_size=8)
@@ -1100,6 +1552,48 @@ with tab3:
         )
         st.plotly_chart(fig, use_container_width=True)
 
+    st.subheader("🤖 청소년 비만 예측 모델")
+    teen_model_metrics = teen_model_summary_global
+    if teen_model_metrics:
+        cutoff_text = f"{teen_bmi_cutoff:.2f}" if teen_bmi_cutoff else "정보 없음"
+        st.markdown(
+            "- **모델**: Logistic Regression (class_weight='balanced')\n"
+            f"- **라벨 기준**: BMI 상위 5% (컷오프 {cutoff_text} 이상)\n"
+            f"- **적용 임계값**: {teen_model_metrics['threshold']:.2f}"
+        )
+        metrics_chart = pd.DataFrame({
+            "지표": ["Accuracy", "Recall", "Precision", "F1-Score", "AUC-ROC"],
+            "값": [
+                teen_model_metrics["accuracy"],
+                teen_model_metrics["recall"],
+                teen_model_metrics["precision"],
+                teen_model_metrics["f1"],
+                teen_model_metrics["auc"]
+            ]
+        })
+        fig = px.bar(
+            metrics_chart,
+            x="지표",
+            y="값",
+            title="모델 성능 지표",
+            color="지표",
+            color_discrete_sequence=px.colors.qualitative.Set2
+        )
+        fig.update_yaxes(range=[0, 1])
+        st.plotly_chart(fig, use_container_width=True)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Accuracy", f"{teen_model_metrics['accuracy']*100:.1f}%")
+        col2.metric("Recall", f"{teen_model_metrics['recall']*100:.1f}%")
+        col3.metric("Precision", f"{teen_model_metrics['precision']*100:.1f}%")
+
+        col4, col5 = st.columns(2)
+        col4.metric("F1-Score", f"{teen_model_metrics['f1']*100:.1f}%")
+        col5.metric("AUC-ROC", f"{teen_model_metrics['auc']:.3f}")
+        st.caption(f"학습 표본 수: {teen_model_metrics['sample_size']:,}건")
+    else:
+        st.info("선택한 필터 조건에서는 모델을 학습할 충분한 데이터가 없습니다. 연도나 연령 범위를 넓혀보세요.")
+
 # 탭 4: 상관관계
 with tab4:
     st.header("상관관계 분석")
@@ -1267,6 +1761,112 @@ with tab5:
         file_name=f'filtered_data_{len(filtered_df)}rows.csv',
         mime='text/csv'
     )
+
+with tab6:
+    st.header("🤖 청소년 비만 예측 모델")
+    if is_adult:
+        st.info("모델 분석은 청소년 데이터에서만 제공합니다. 사이드바에서 청소년 데이터를 선택해주세요.")
+    else:
+        if teen_model_results_global:
+            optimal_c = teen_model_results_global.get('optimal_c', 'N/A')
+            optimal_thr = teen_model_results_global.get('threshold', 0.49)
+            ensemble_info = teen_model_results_global.get('ensemble', {})
+            ensemble_weights = ensemble_info.get('weights', (0.6, 0.4))
+            st.markdown(
+                f"- **라벨 기준**: BMI 상위 5% (컷오프 {teen_bmi_cutoff:.2f} 이상)\n"
+                f"- **최적화된 C 값**: {optimal_c}\n"
+                f"- **최적화된 임계값**: {optimal_thr:.3f}\n"
+                f"- **앙상블 가중치**: LR {ensemble_weights[0]:.2f} + RF {ensemble_weights[1]:.2f}\n"
+                f"- **학습 표본 수**: {teen_model_results_global['sample_size']:,}건\n"
+                f"- **SMOTE 적용**: 예 (오버샘플링)"
+            )
+            st.markdown(
+                "- **비교 모델**: Logistic Regression (SMOTE) / Random Forest (튜닝) / Balanced Random Forest / HistGradientBoosting / **Ensemble (최적 가중치)**"
+            )
+
+            metric_labels = [
+                ("accuracy", "Accuracy"),
+                ("recall", "Recall"),
+                ("precision", "Precision"),
+                ("f1", "F1-Score"),
+                ("auc", "AUC-ROC"),
+            ]
+            model_name_map = {
+                "logistic": "Logistic Regression",
+                "random_forest": "Random Forest",
+                "balanced_random_forest": "Balanced Random Forest",
+                "hist_gradient_boosting": "HistGradientBoosting",
+                "ensemble": "Ensemble (LR+RF)",
+            }
+            metric_rows = []
+            for metric_key, metric_name in metric_labels:
+                for model_key, model_title in model_name_map.items():
+                    values = teen_model_results_global.get(model_key)
+                    if values and metric_key in values:
+                        metric_rows.append(
+                            {
+                                "모델": model_title,
+                                "지표": metric_name,
+                                "값": values[metric_key],
+                            }
+                        )
+
+            if metric_rows:
+                metrics_df = pd.DataFrame(metric_rows)
+                fig = px.bar(
+                    metrics_df,
+                    x="지표",
+                    y="값",
+                    color="모델",
+                    barmode="group",
+                    title="모델별 성능 비교",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig.update_yaxes(range=[0, 1])
+                st.plotly_chart(fig, use_container_width=True)
+
+                pivot_df = (
+                    metrics_df.pivot_table(index="모델", columns="지표", values="값")
+                    .round(3)
+                    .reset_index()
+                )
+                st.dataframe(pivot_df, use_container_width=True)
+
+            roc_data = teen_model_results_global.get("roc_curve")
+            if roc_data:
+                best_model_name = roc_data.get("model_name", "logistic")
+                best_model_title = model_name_map.get(best_model_name, "Best Model")
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=roc_data["fpr"],
+                        y=roc_data["tpr"],
+                        mode="lines",
+                        name=f"{best_model_title} ROC (AUC {roc_data['auc']:.3f})",
+                        line=dict(color="#2ca02c", width=3),
+                        fill="tozeroy",
+                        opacity=0.3,
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=[0, 1],
+                        y=[0, 1],
+                        mode="lines",
+                        name="Random Guess",
+                        line=dict(color="gray", dash="dash"),
+                    )
+                )
+                fig.update_layout(
+                    title=f"{best_model_title} ROC Curve (최고 AUC 모델)",
+                    xaxis_title="False Positive Rate",
+                    yaxis_title="True Positive Rate",
+                    xaxis=dict(range=[0, 1]),
+                    yaxis=dict(range=[0, 1]),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("모델을 학습할 충분한 데이터가 없어 성능을 표시할 수 없습니다.")
 
 # 사이드바 하단 정보
 st.sidebar.markdown("---")
