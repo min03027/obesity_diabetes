@@ -1082,73 +1082,156 @@ with tab3:
     if not is_adult and 'TEEN_OBESE_TOP5' in df.columns:
         st.markdown("---")
         st.subheader("📈 청소년 BMI 트렌드 (2015-2016 제외)")
-
-        if True:
-            # Mean BMI, 95th percentile BMI, Top 5% Obesity Share 복합 그래프
-            teen_bmi_trend = df[['YEAR', 'BMI', 'TEEN_OBESE_TOP5']].dropna()
-            if len(teen_bmi_trend) > 0:
-                year_stats = teen_bmi_trend.groupby('YEAR').agg({
-                    'BMI': ['mean', lambda x: x.quantile(0.95)],
-                    'TEEN_OBESE_TOP5': 'mean'
-                }).reset_index()
-                year_stats.columns = ['YEAR', 'Mean_BMI', 'P95_BMI', 'Obesity_Share']
-                year_stats['Obesity_Share'] *= 100
-                year_stats = year_stats.sort_values('YEAR')
+        
+        # 전체 데이터 그래프
+        teen_bmi_trend_all = df[['YEAR', 'BMI', 'TEEN_OBESE_TOP5']].dropna()
+        if len(teen_bmi_trend_all) > 0:
+            year_stats_all = teen_bmi_trend_all.groupby('YEAR').agg({
+                'BMI': ['mean', lambda x: x.quantile(0.95)],
+                'TEEN_OBESE_TOP5': 'mean'
+            }).reset_index()
+            year_stats_all.columns = ['YEAR', 'Mean_BMI', 'P95_BMI', 'Obesity_Share']
+            year_stats_all['Obesity_Share'] *= 100
+            year_stats_all = year_stats_all.sort_values('YEAR')
+            
+            if len(year_stats_all) > 0:
+                fig_all = make_subplots(specs=[[{"secondary_y": True}]])
                 
-                if len(year_stats) > 0:
-                    from plotly.subplots import make_subplots
+                # Mean BMI (파란 선)
+                fig_all.add_trace(
+                    go.Scatter(
+                        x=year_stats_all['YEAR'],
+                        y=year_stats_all['Mean_BMI'],
+                        mode='lines+markers',
+                        name='Mean BMI',
+                        line=dict(color='blue', width=3),
+                        marker=dict(size=8, symbol='circle')
+                    ),
+                    secondary_y=False,
+                )
+                
+                # 95th percentile BMI (주황 선)
+                fig_all.add_trace(
+                    go.Scatter(
+                        x=year_stats_all['YEAR'],
+                        y=year_stats_all['P95_BMI'],
+                        mode='lines+markers',
+                        name='95th percentile BMI',
+                        line=dict(color='orange', width=3),
+                        marker=dict(size=8, symbol='square')
+                    ),
+                    secondary_y=False,
+                )
+                
+                # Top 5% Obesity Share (회색 막대)
+                fig_all.add_trace(
+                    go.Bar(
+                        x=year_stats_all['YEAR'],
+                        y=year_stats_all['Obesity_Share'],
+                        name='Top 5% Obesity Share (%)',
+                        marker_color='lightgray',
+                        opacity=0.7
+                    ),
+                    secondary_y=True,
+                )
+                
+                fig_all.update_xaxes(title_text="Year")
+                fig_all.update_yaxes(title_text="BMI", secondary_y=False, range=[20, 30])
+                fig_all.update_yaxes(title_text="Obesity Share (%)", secondary_y=True, range=[0, 7])
+                
+                fig_all.update_layout(
+                    title="Teen BMI Trend (2015-2016 excluded)",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    height=500
+                )
+                
+                st.plotly_chart(fig_all, use_container_width=True, key="teen_bmi_trend_combo")
+        
+        # 성별 구분 그래프
+        if 'SEX' in df.columns:
+            st.markdown("---")
+            st.subheader("📊 청소년 BMI 트렌드 (성별 구분)")
+            
+            teen_bmi_trend = df[['YEAR', 'BMI', 'TEEN_OBESE_TOP5', 'SEX']].dropna()
+            if len(teen_bmi_trend) > 0:
+                # 성별별 통계 계산
+                sex_stats = {}
+                for sex_val in [1.0, 2.0]:
+                    sex_name = '남성' if sex_val == 1.0 else '여성'
+                    sex_data = teen_bmi_trend[teen_bmi_trend['SEX'] == sex_val]
                     
-                    fig_all = make_subplots(specs=[[{"secondary_y": True}]])
+                    if len(sex_data) > 0:
+                        year_stats = sex_data.groupby('YEAR').agg({
+                            'BMI': ['mean', lambda x: x.quantile(0.95)],
+                            'TEEN_OBESE_TOP5': 'mean'
+                        }).reset_index()
+                        year_stats.columns = ['YEAR', 'Mean_BMI', 'P95_BMI', 'Obesity_Share']
+                        year_stats['Obesity_Share'] *= 100
+                        year_stats = year_stats.sort_values('YEAR')
+                        sex_stats[sex_name] = year_stats
+                
+                if len(sex_stats) > 0:
+                    fig_gender = make_subplots(specs=[[{"secondary_y": True}]])
                     
-                    # Mean BMI (파란 선)
-                    fig_all.add_trace(
-                        go.Scatter(
-                            x=year_stats['YEAR'],
-                            y=year_stats['Mean_BMI'],
-                            mode='lines+markers',
-                            name='Mean BMI',
-                            line=dict(color='blue', width=3),
-                            marker=dict(size=8, symbol='circle')
-                        ),
-                        secondary_y=False,
-                    )
+                    # 각 성별별로 그래프 추가
+                    colors = {
+                        '남성': {'mean': 'blue', 'p95': 'darkblue', 'share': 'lightblue'},
+                        '여성': {'mean': 'pink', 'p95': 'red', 'share': 'lightpink'}
+                    }
                     
-                    # 95th percentile BMI (주황 선)
-                    fig_all.add_trace(
-                        go.Scatter(
-                            x=year_stats['YEAR'],
-                            y=year_stats['P95_BMI'],
-                            mode='lines+markers',
-                            name='95th percentile BMI',
-                            line=dict(color='orange', width=3),
-                            marker=dict(size=8, symbol='square')
-                        ),
-                        secondary_y=False,
-                    )
+                    for sex_name, stats in sex_stats.items():
+                        if len(stats) > 0:
+                            color = colors[sex_name]
+                            
+                            # Mean BMI
+                            fig_gender.add_trace(
+                                go.Scatter(
+                                    x=stats['YEAR'],
+                                    y=stats['Mean_BMI'],
+                                    mode='lines+markers',
+                                    name=f'{sex_name} Mean BMI',
+                                    line=dict(color=color['mean'], width=3),
+                                    marker=dict(size=8, symbol='circle')
+                                ),
+                                secondary_y=False,
+                            )
+                            
+                            # 95th percentile BMI
+                            fig_gender.add_trace(
+                                go.Scatter(
+                                    x=stats['YEAR'],
+                                    y=stats['P95_BMI'],
+                                    mode='lines+markers',
+                                    name=f'{sex_name} 95th percentile BMI',
+                                    line=dict(color=color['p95'], width=3, dash='dash'),
+                                    marker=dict(size=8, symbol='square')
+                                ),
+                                secondary_y=False,
+                            )
+                            
+                            # Top 5% Obesity Share
+                            fig_gender.add_trace(
+                                go.Bar(
+                                    x=stats['YEAR'],
+                                    y=stats['Obesity_Share'],
+                                    name=f'{sex_name} Top 5% Obesity Share (%)',
+                                    marker_color=color['share'],
+                                    opacity=0.7
+                                ),
+                                secondary_y=True,
+                            )
                     
-                    # Top 5% Obesity Share (회색 막대)
-                    fig_all.add_trace(
-                        go.Bar(
-                            x=year_stats['YEAR'],
-                            y=year_stats['Obesity_Share'],
-                            name='Top 5% Obesity Share (%)',
-                            marker_color='lightgray',
-                            opacity=0.7
-                        ),
-                        secondary_y=True,
-                    )
+                    fig_gender.update_xaxes(title_text="Year")
+                    fig_gender.update_yaxes(title_text="BMI", secondary_y=False, range=[20, 30])
+                    fig_gender.update_yaxes(title_text="Obesity Share (%)", secondary_y=True, range=[0, 7])
                     
-                    fig_all.update_xaxes(title_text="Year")
-                    fig_all.update_yaxes(title_text="BMI", secondary_y=False, range=[20, 30])
-                    fig_all.update_yaxes(title_text="Obesity Share (%)", secondary_y=True, range=[0, 7])
-                    
-                    fig_all.update_layout(
-                        title="Teen BMI Trend (2015-2016 excluded)",
+                    fig_gender.update_layout(
+                        title="Teen BMI Trend by Gender (2015-2016 excluded)",
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        height=500
+                        height=600
                     )
                     
-                    st.plotly_chart(fig_all, use_container_width=True, key="teen_bmi_trend_combo")
+                    st.plotly_chart(fig_gender, use_container_width=True, key="teen_bmi_trend_combo_gender")
             
             # 비만과 당뇨의 상관관계 시각화
             if 'OBESITY' in filtered_df.columns and 'DIABETES' in filtered_df.columns:
@@ -2009,11 +2092,9 @@ with tab6:
                 odds_ratios = logistic_info['odds_ratios']
                 coefficients = logistic_info['coefficients']
                 
-                # 오즈비 기준으로 정렬
-                sorted_features = sorted(odds_ratios.items(), key=lambda x: abs(x[1] - 1.0), reverse=True)
-                
-                # 상위 20개 피처만 표시
-                top_features = sorted_features[:20]
+                # 핵심 4개 피처만 선택: AGE, SEX, F_FRUIT, F_VEG
+                core_features = ['AGE', 'SEX', 'F_FRUIT', 'F_VEG']
+                top_features = [(f, odds_ratios[f]) for f in core_features if f in odds_ratios]
                 
                 # 데이터프레임 생성
                 odds_df = pd.DataFrame({
@@ -2062,11 +2143,11 @@ with tab6:
                                   annotation_text="기준선 (오즈비 = 1.0)")
                 
                 fig_odds.update_layout(
-                    title="주요 피처별 오즈비 (상위 20개)",
+                    title="핵심 피처별 오즈비 (AGE, SEX, F_FRUIT, F_VEG)",
                     xaxis_title="피처",
                     yaxis_title="오즈비 (Odds Ratio)",
                     xaxis_tickangle=-45,
-                    height=600,
+                    height=500,
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
                 
