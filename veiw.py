@@ -1892,12 +1892,16 @@ with tab6:
             optimal_c = teen_model_results_global.get('optimal_c', 'N/A')
             optimal_thr = teen_model_results_global.get('threshold', 0.49)
             ensemble_info = teen_model_results_global.get('ensemble', {})
-            ensemble_weights = ensemble_info.get('weights', (0.6, 0.4))
+            ensemble_weights = ensemble_info.get('weights', [0.6, 0.4])
+            if len(ensemble_weights) >= 3 and ensemble_weights[2] > 0:
+                weight_text = f"LR {ensemble_weights[0]:.2f} + RF {ensemble_weights[1]:.2f} + HGB {ensemble_weights[2]:.2f}"
+            else:
+                weight_text = f"LR {ensemble_weights[0]:.2f} + RF {ensemble_weights[1]:.2f}"
             st.markdown(
                 f"- **라벨 기준**: BMI 상위 5% (컷오프 {teen_bmi_cutoff:.2f} 이상)\n"
                 f"- **최적화된 C 값**: {optimal_c}\n"
                 f"- **최적화된 임계값**: {optimal_thr:.3f}\n"
-                f"- **앙상블 가중치**: LR {ensemble_weights[0]:.2f} + RF {ensemble_weights[1]:.2f}\n"
+                f"- **앙상블 가중치**: {weight_text}\n"
                 f"- **학습 표본 수**: {teen_model_results_global['sample_size']:,}건\n"
                 f"- **SMOTE 적용**: 예 (오버샘플링)"
             )
@@ -1986,6 +1990,94 @@ with tab6:
                     yaxis=dict(range=[0, 1]),
                 )
                 st.plotly_chart(fig, use_container_width=True)
+            
+            # 오즈비(Odds Ratio) 해석
+            logistic_info = teen_model_results_global.get('logistic', {})
+            if 'odds_ratios' in logistic_info and 'coefficients' in logistic_info:
+                st.markdown("---")
+                st.subheader("📊 Logistic Regression 오즈비(Odds Ratio) 해석")
+                st.markdown(
+                    """
+                    **오즈비(Odds Ratio)란?**
+                    - 오즈비 = exp(계수)
+                    - 오즈비 > 1: 해당 변수가 증가하면 비만 위험이 증가
+                    - 오즈비 < 1: 해당 변수가 증가하면 비만 위험이 감소
+                    - 오즈비 = 1: 비만 위험에 영향 없음
+                    """
+                )
+                
+                odds_ratios = logistic_info['odds_ratios']
+                coefficients = logistic_info['coefficients']
+                
+                # 오즈비 기준으로 정렬
+                sorted_features = sorted(odds_ratios.items(), key=lambda x: abs(x[1] - 1.0), reverse=True)
+                
+                # 상위 20개 피처만 표시
+                top_features = sorted_features[:20]
+                
+                # 데이터프레임 생성
+                odds_df = pd.DataFrame({
+                    '피처': [f[0] for f in top_features],
+                    '계수': [coefficients[f[0]] for f in top_features],
+                    '오즈비': [f[1] for f in top_features],
+                    '해석': [
+                        f"비만 위험 {f[1]:.2f}배 {'증가' if f[1] > 1 else '감소'}" 
+                        if f[1] != 1.0 else "영향 없음"
+                        for f in top_features
+                    ]
+                })
+                
+                # 오즈비 기준으로 정렬 (내림차순)
+                odds_df = odds_df.sort_values('오즈비', ascending=False)
+                
+                # 그래프 생성
+                fig_odds = go.Figure()
+                
+                # 오즈비 > 1 (위험 증가)
+                risk_increase = odds_df[odds_df['오즈비'] > 1.0]
+                if len(risk_increase) > 0:
+                    fig_odds.add_trace(go.Bar(
+                        x=risk_increase['피처'],
+                        y=risk_increase['오즈비'],
+                        name='위험 증가',
+                        marker_color='red',
+                        text=[f"{x:.2f}" for x in risk_increase['오즈비']],
+                        textposition='outside'
+                    ))
+                
+                # 오즈비 < 1 (위험 감소)
+                risk_decrease = odds_df[odds_df['오즈비'] < 1.0]
+                if len(risk_decrease) > 0:
+                    fig_odds.add_trace(go.Bar(
+                        x=risk_decrease['피처'],
+                        y=risk_decrease['오즈비'],
+                        name='위험 감소',
+                        marker_color='blue',
+                        text=[f"{x:.2f}" for x in risk_decrease['오즈비']],
+                        textposition='outside'
+                    ))
+                
+                # 기준선 (오즈비 = 1)
+                fig_odds.add_hline(y=1.0, line_dash="dash", line_color="gray", 
+                                  annotation_text="기준선 (오즈비 = 1.0)")
+                
+                fig_odds.update_layout(
+                    title="주요 피처별 오즈비 (상위 20개)",
+                    xaxis_title="피처",
+                    yaxis_title="오즈비 (Odds Ratio)",
+                    xaxis_tickangle=-45,
+                    height=600,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                
+                st.plotly_chart(fig_odds, use_container_width=True)
+                
+                # 표로도 표시
+                st.markdown("#### 📋 상세 오즈비 표")
+                display_odds_df = odds_df[['피처', '계수', '오즈비', '해석']].copy()
+                display_odds_df['계수'] = display_odds_df['계수'].round(4)
+                display_odds_df['오즈비'] = display_odds_df['오즈비'].round(4)
+                st.dataframe(display_odds_df, use_container_width=True, height=400)
         else:
             st.info("모델을 학습할 충분한 데이터가 없어 성능을 표시할 수 없습니다.")
 

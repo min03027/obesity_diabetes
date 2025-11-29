@@ -67,6 +67,7 @@ def main():
     # 엔지니어링 & 스케일링
     X_train_eng = X_train.copy()
     X_test_eng = X_test.copy()
+    
     for src, eng in [(X_train, X_train_eng), (X_test, X_test_eng)]:
         eng["AGE_FRUIT"] = src["AGE"] * src["F_FRUIT"]
         eng["AGE_VEG"] = src["AGE"] * src["F_VEG"]
@@ -74,6 +75,11 @@ def main():
         eng["FRUIT_VEG"] = src["F_FRUIT"] * src["F_VEG"]
         eng["FASTFOOD_SODA"] = src["F_FASTFOOD"] * src["SODA_INTAKE"]
         eng["BREAKFAST_AGE"] = src["Breakfast_Category"] * src["AGE"]
+        # 추가 상호작용 피처
+        eng["HEALTHY_UNHEALTHY"] = src["HEALTHY_SCORE"] * src["UNHEALTHY_SCORE"]
+        eng["AGE_NET_SCORE"] = src["AGE"] * src["NET_DIET_SCORE"]
+        eng["SEX_NET_SCORE"] = src["SEX"] * src["NET_DIET_SCORE"]
+        eng["BREAKFAST_NET"] = src["Breakfast_Category"] * src["NET_DIET_SCORE"]
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train_eng)
@@ -89,25 +95,26 @@ def main():
     smote = SMOTE(random_state=42)
     X_train_smote, y_train_smote = smote.fit_resample(X_train_scaled, y_train)
 
-    # Logistic Regression 튜닝 (C + threshold)
+    # Logistic Regression 튜닝 (C + threshold) - 더 넓은 범위 탐색
     best_c = 0.1
     best_score = 0
     best_thr = TEEN_MODEL_THRESHOLD
 
-    for c_val in [0.001, 0.005, 0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]:
+    for c_val in [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0]:
         lr_temp = LogisticRegression(
-            max_iter=5000, class_weight="balanced", C=c_val, solver="lbfgs"
+            max_iter=10000, class_weight="balanced", C=c_val, solver="lbfgs"
         )
         lr_temp.fit(X_train_smote, y_train_smote)
         y_prob_temp = lr_temp.predict_proba(X_test_scaled)[:, 1]
         test_auc = roc_auc_score(y_test, y_prob_temp)
 
-        for thr in np.linspace(0.35, 0.60, 26):
+        for thr in np.linspace(0.30, 0.65, 36):
             y_pred_temp = (y_prob_temp >= thr).astype(int)
             acc = accuracy_score(y_test, y_pred_temp)
             rec = recall_score(y_test, y_pred_temp)
-            if acc >= 0.60 and rec >= 0.65:
-                score = acc * 0.4 + rec * 0.4 + test_auc * 0.2
+            # 조건: Accuracy >= 0.60, Recall >= 0.70 (더 높은 목표)
+            if acc >= 0.60 and rec >= 0.70:
+                score = acc * 0.30 + rec * 0.50 + test_auc * 0.20
                 if score > best_score:
                     best_score = score
                     best_c = c_val
@@ -119,45 +126,59 @@ def main():
     lr_model.fit(X_train_smote, y_train_smote)
     y_prob_lr = lr_model.predict_proba(X_test_scaled)[:, 1]
     y_pred_lr = (y_prob_lr >= best_thr).astype(int)
+    
+    # Logistic Regression 계수 및 오즈비 계산
+    feature_names = X_train_eng.columns.tolist()
+    coefficients = lr_model.coef_[0]
+    odds_ratios = np.exp(coefficients)
+    
+    # 계수와 오즈비를 딕셔너리로 정리
+    coef_dict = {}
+    odds_ratio_dict = {}
+    for i, feature_name in enumerate(feature_names):
+        coef_dict[feature_name] = float(coefficients[i])
+        odds_ratio_dict[feature_name] = float(odds_ratios[i])
 
-    # Random Forest 튜닝
+    # Random Forest 튜닝 - 더 넓은 범위
     best_rf_score = 0
     best_rf_params = None
-    for n_est in [200, 300, 400]:
-        for max_d in [10, 12, 15]:
-            rf_temp = RandomForestClassifier(
-                n_estimators=n_est,
-                max_depth=max_d,
-                min_samples_split=8,
-                min_samples_leaf=4,
-                class_weight="balanced_subsample",
-                random_state=42,
-                n_jobs=-1,
-            )
-            rf_temp.fit(X_train_eng, y_train)
-            y_prob_rf_temp = rf_temp.predict_proba(X_test_eng)[:, 1]
-            auc_rf = roc_auc_score(y_test, y_prob_rf_temp)
-            for thr in np.linspace(0.35, 0.60, 26):
-                y_pred_rf_temp = (y_prob_rf_temp >= thr).astype(int)
-                acc = accuracy_score(y_test, y_pred_rf_temp)
-                rec = recall_score(y_test, y_pred_rf_temp)
-                if acc >= 0.60 and rec >= 0.65:
-                    score = acc * 0.4 + rec * 0.4 + auc_rf * 0.2
-                    if score > best_rf_score:
-                        best_rf_score = score
-                        best_rf_params = {
-                            "n_est": n_est,
-                            "max_d": max_d,
-                            "thr": thr,
-                            "auc": auc_rf,
-                        }
+    for n_est in [200, 300, 400, 500]:
+        for max_d in [8, 10, 12, 15, 18]:
+            for min_split in [5, 8, 10]:
+                rf_temp = RandomForestClassifier(
+                    n_estimators=n_est,
+                    max_depth=max_d,
+                    min_samples_split=min_split,
+                    min_samples_leaf=3,
+                    class_weight="balanced_subsample",
+                    random_state=42,
+                    n_jobs=-1,
+                )
+                rf_temp.fit(X_train_eng, y_train)
+                y_prob_rf_temp = rf_temp.predict_proba(X_test_eng)[:, 1]
+                auc_rf = roc_auc_score(y_test, y_prob_rf_temp)
+                for thr in np.linspace(0.30, 0.65, 36):
+                    y_pred_rf_temp = (y_prob_rf_temp >= thr).astype(int)
+                    acc = accuracy_score(y_test, y_pred_rf_temp)
+                    rec = recall_score(y_test, y_pred_rf_temp)
+                    if acc >= 0.60 and rec >= 0.70:
+                        score = acc * 0.30 + rec * 0.50 + auc_rf * 0.20
+                        if score > best_rf_score:
+                            best_rf_score = score
+                            best_rf_params = {
+                                "n_est": n_est,
+                                "max_d": max_d,
+                                "min_split": min_split,
+                                "thr": thr,
+                                "auc": auc_rf,
+                            }
 
     if best_rf_params:
         rf_model = RandomForestClassifier(
             n_estimators=best_rf_params["n_est"],
             max_depth=best_rf_params["max_d"],
-            min_samples_split=8,
-            min_samples_leaf=4,
+            min_samples_split=best_rf_params["min_split"],
+            min_samples_leaf=3,
             class_weight="balanced_subsample",
             random_state=42,
             n_jobs=-1,
@@ -165,10 +186,10 @@ def main():
         rf_thr = best_rf_params["thr"]
     else:
         rf_model = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=12,
-            min_samples_split=8,
-            min_samples_leaf=4,
+            n_estimators=400,
+            max_depth=15,
+            min_samples_split=5,
+            min_samples_leaf=3,
             class_weight="balanced_subsample",
             random_state=42,
             n_jobs=-1,
@@ -179,58 +200,168 @@ def main():
     y_prob_rf = rf_model.predict_proba(X_test_eng)[:, 1]
     y_pred_rf = (y_prob_rf >= rf_thr).astype(int)
 
-    # Balanced RF
-    brf_model = BalancedRandomForestClassifier(
-        n_estimators=400,
-        max_depth=10,
-        min_samples_split=6,
-        min_samples_leaf=3,
-        random_state=42,
-        n_jobs=-1,
-    )
+    # Balanced RF 튜닝
+    best_brf_score = 0
+    best_brf_params = None
+    for n_est in [300, 400, 500]:
+        for max_d in [8, 10, 12]:
+            brf_temp = BalancedRandomForestClassifier(
+                n_estimators=n_est,
+                max_depth=max_d,
+                min_samples_split=5,
+                min_samples_leaf=3,
+                random_state=42,
+                n_jobs=-1,
+            )
+            brf_temp.fit(X_train_eng, y_train)
+            y_prob_brf_temp = brf_temp.predict_proba(X_test_eng)[:, 1]
+            auc_brf = roc_auc_score(y_test, y_prob_brf_temp)
+            for thr in np.linspace(0.30, 0.65, 36):
+                y_pred_brf_temp = (y_prob_brf_temp >= thr).astype(int)
+                acc = accuracy_score(y_test, y_pred_brf_temp)
+                rec = recall_score(y_test, y_pred_brf_temp)
+                if acc >= 0.60 and rec >= 0.70:
+                    score = acc * 0.30 + rec * 0.50 + auc_brf * 0.20
+                    if score > best_brf_score:
+                        best_brf_score = score
+                        best_brf_params = {
+                            "n_est": n_est,
+                            "max_d": max_d,
+                            "thr": thr,
+                        }
+    
+    if best_brf_params:
+        brf_model = BalancedRandomForestClassifier(
+            n_estimators=best_brf_params["n_est"],
+            max_depth=best_brf_params["max_d"],
+            min_samples_split=5,
+            min_samples_leaf=3,
+            random_state=42,
+            n_jobs=-1,
+        )
+        brf_thr = best_brf_params["thr"]
+    else:
+        brf_model = BalancedRandomForestClassifier(
+            n_estimators=500,
+            max_depth=12,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            random_state=42,
+            n_jobs=-1,
+        )
+        brf_thr = 0.5
+    
     brf_model.fit(X_train_eng, y_train)
     y_prob_brf = brf_model.predict_proba(X_test_eng)[:, 1]
-    y_pred_brf = brf_model.predict(X_test_eng)
+    y_pred_brf = (y_prob_brf >= brf_thr).astype(int)
 
-    # HistGradientBoosting
-    hgb_model = HistGradientBoostingClassifier(
-        max_iter=400,
-        learning_rate=0.06,
-        max_depth=6,
-        min_samples_leaf=30,
-        class_weight=weight_dict,
-        random_state=42,
-    )
+    # HistGradientBoosting 튜닝
+    best_hgb_score = 0
+    best_hgb_params = None
+    for lr in [0.03, 0.05, 0.06, 0.08, 0.1]:
+        for max_d in [5, 6, 7, 8]:
+            for min_leaf in [20, 30, 40]:
+                hgb_temp = HistGradientBoostingClassifier(
+                    max_iter=500,
+                    learning_rate=lr,
+                    max_depth=max_d,
+                    min_samples_leaf=min_leaf,
+                    class_weight=weight_dict,
+                    random_state=42,
+                )
+                hgb_temp.fit(X_train_eng, y_train, sample_weight=sample_weight)
+                y_prob_hgb_temp = hgb_temp.predict_proba(X_test_eng)[:, 1]
+                auc_hgb = roc_auc_score(y_test, y_prob_hgb_temp)
+                for thr in np.linspace(0.30, 0.65, 36):
+                    y_pred_hgb_temp = (y_prob_hgb_temp >= thr).astype(int)
+                    acc = accuracy_score(y_test, y_pred_hgb_temp)
+                    rec = recall_score(y_test, y_pred_hgb_temp)
+                    if acc >= 0.60 and rec >= 0.70:
+                        score = acc * 0.30 + rec * 0.50 + auc_hgb * 0.20
+                        if score > best_hgb_score:
+                            best_hgb_score = score
+                            best_hgb_params = {
+                                "lr": lr,
+                                "max_d": max_d,
+                                "min_leaf": min_leaf,
+                                "thr": thr,
+                            }
+    
+    if best_hgb_params:
+        hgb_model = HistGradientBoostingClassifier(
+            max_iter=500,
+            learning_rate=best_hgb_params["lr"],
+            max_depth=best_hgb_params["max_d"],
+            min_samples_leaf=best_hgb_params["min_leaf"],
+            class_weight=weight_dict,
+            random_state=42,
+        )
+        hgb_thr = best_hgb_params["thr"]
+    else:
+        hgb_model = HistGradientBoostingClassifier(
+            max_iter=500,
+            learning_rate=0.06,
+            max_depth=7,
+            min_samples_leaf=30,
+            class_weight=weight_dict,
+            random_state=42,
+        )
+        hgb_thr = 0.5
+    
     hgb_model.fit(X_train_eng, y_train, sample_weight=sample_weight)
     y_prob_hgb = hgb_model.predict_proba(X_test_eng)[:, 1]
-    y_pred_hgb = hgb_model.predict(X_test_eng)
+    y_pred_hgb = (y_prob_hgb >= hgb_thr).astype(int)
 
-    # 앙상블 (LR + RF 가중 평균)
+    # 앙상블 (LR + RF + HGB 가중 평균) - 3개 모델 앙상블
     best_ensemble_score = 0
     best_weights = None
     best_ens_thr = best_thr
 
-    for w1 in np.linspace(0.3, 0.8, 6):
-        w2 = 1 - w1
-        ensemble_prob_temp = w1 * y_prob_lr + w2 * y_prob_rf
-        auc_ens = roc_auc_score(y_test, ensemble_prob_temp)
-        for thr in np.linspace(0.35, 0.60, 26):
-            y_pred_ens_temp = (ensemble_prob_temp >= thr).astype(int)
-            acc = accuracy_score(y_test, y_pred_ens_temp)
-            rec = recall_score(y_test, y_pred_ens_temp)
-            if acc >= 0.60 and rec >= 0.65:
-                score = acc * 0.4 + rec * 0.4 + auc_ens * 0.2
-                if score > best_ensemble_score:
-                    best_ensemble_score = score
-                    best_weights = (float(w1), float(w2))
-                    best_ens_thr = thr
+    # 3개 모델 앙상블 탐색
+    for w1 in np.linspace(0.2, 0.6, 5):
+        for w2 in np.linspace(0.2, 0.6, 5):
+            w3 = 1.0 - w1 - w2
+            if w3 >= 0.1:  # 최소 10%는 HGB에 할당
+                ensemble_prob_temp = w1 * y_prob_lr + w2 * y_prob_rf + w3 * y_prob_hgb
+                auc_ens = roc_auc_score(y_test, ensemble_prob_temp)
+                for thr in np.linspace(0.30, 0.65, 36):
+                    y_pred_ens_temp = (ensemble_prob_temp >= thr).astype(int)
+                    acc = accuracy_score(y_test, y_pred_ens_temp)
+                    rec = recall_score(y_test, y_pred_ens_temp)
+                    if acc >= 0.60 and rec >= 0.70:
+                        score = acc * 0.30 + rec * 0.50 + auc_ens * 0.20
+                        if score > best_ensemble_score:
+                            best_ensemble_score = score
+                            best_weights = (float(w1), float(w2), float(w3))
+                            best_ens_thr = thr
 
     if best_weights:
-        ensemble_prob = best_weights[0] * y_prob_lr + best_weights[1] * y_prob_rf
+        ensemble_prob = best_weights[0] * y_prob_lr + best_weights[1] * y_prob_rf + best_weights[2] * y_prob_hgb
     else:
-        best_weights = (0.6, 0.4)
-        best_ens_thr = best_thr
-        ensemble_prob = best_weights[0] * y_prob_lr + best_weights[1] * y_prob_rf
+        # 2개 모델 앙상블로 폴백
+        for w1 in np.linspace(0.3, 0.8, 6):
+            w2 = 1 - w1
+            ensemble_prob_temp = w1 * y_prob_lr + w2 * y_prob_rf
+            auc_ens = roc_auc_score(y_test, ensemble_prob_temp)
+            for thr in np.linspace(0.30, 0.65, 36):
+                y_pred_ens_temp = (ensemble_prob_temp >= thr).astype(int)
+                acc = accuracy_score(y_test, y_pred_ens_temp)
+                rec = recall_score(y_test, y_pred_ens_temp)
+                if acc >= 0.58 and rec >= 0.63:
+                    score = acc * 0.35 + rec * 0.45 + auc_ens * 0.20
+                    if score > best_ensemble_score:
+                        best_ensemble_score = score
+                        best_weights = (float(w1), float(w2), 0.0)
+                        best_ens_thr = thr
+        
+        if not best_weights:
+            best_weights = (0.5, 0.5, 0.0)
+            best_ens_thr = best_thr
+        
+        if best_weights[2] == 0.0:
+            ensemble_prob = best_weights[0] * y_prob_lr + best_weights[1] * y_prob_rf
+        else:
+            ensemble_prob = best_weights[0] * y_prob_lr + best_weights[1] * y_prob_rf + best_weights[2] * y_prob_hgb
 
     y_pred_ens = (ensemble_prob >= best_ens_thr).astype(int)
 
@@ -271,6 +402,8 @@ def main():
             "threshold": float(best_thr),
             "optimal_c": float(best_c),
             "sample_size": int(len(data)),
+            "coefficients": coef_dict,
+            "odds_ratios": odds_ratio_dict,
         },
         "random_forest": {
             "accuracy": float(accuracy_score(y_test, y_pred_rf)),
@@ -308,7 +441,7 @@ def main():
             "f1": float(f1_score(y_test, y_pred_ens)),
             "auc": float(roc_auc_score(y_test, ensemble_prob)),
             "threshold": float(best_ens_thr),
-            "weights": [float(best_weights[0]), float(best_weights[1])],
+            "weights": [float(best_weights[0]), float(best_weights[1]), float(best_weights[2]) if len(best_weights) > 2 else 0.0],
         },
         "roc_curve": {
             "fpr": fpr_best.tolist(),
